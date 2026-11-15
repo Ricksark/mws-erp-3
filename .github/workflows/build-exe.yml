@@ -1,0 +1,289 @@
+name: Build Debug EXE and Publish Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build, Sign, and Publish Debug EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK 9.0.x
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Verify .NET environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dotnetVersion = (& dotnet --version) 2>&1
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($dotnetVersion)) {
+            Write-Error "Failed to detect the active .NET version."
+            exit 1
+          }
+          $dotnetVersion = ($dotnetVersion | Out-String).Trim()
+          Write-Host "dotnet --version: $dotnetVersion"
+          Write-Host "DOTNET_ROOT: $env:DOTNET_ROOT"
+          if ($dotnetVersion -notmatch '^(\d+)\.') {
+            Write-Error "Unable to detect the active .NET major version from '$dotnetVersion'."
+            exit 1
+          }
+          $major = [int]$Matches[1]
+          if ($major -lt 9) {
+            Write-Error "Active .NET major version is $major, which is lower than the required version 9."
+            exit 1
+          }
+          Write-Host "Confirmed active .NET major version: $major (>= 9)."
+
+      - name: Create temporary debug signing certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfxPath = "./debug-signing.pfx"
+          if (Test-Path -LiteralPath $pfxPath -PathType Leaf) {
+            Write-Host "Temporary debug signing certificate already exists."
+          } else {
+            $cert = New-SelfSignedCertificate `
+              -Type CodeSigningCert `
+              -Subject "CN=Debug Build,O=Debug,C=US" `
+              -KeyAlgorithm RSA `
+              -KeyLength 2048 `
+              -NotAfter (Get-Date).AddDays(10000) `
+              -KeyExportPolicy Exportable `
+              -FriendlyName "DebugBuild" `
+              -CertStoreLocation "Cert:\CurrentUser\My"
+            if (-not $cert) {
+              Write-Error "Failed to generate the temporary debug signing certificate."
+              exit 1
+            }
+            $pfxPassword = ConvertTo-SecureString -String "debug" -Force -AsPlainText
+            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pfxPassword | Out-Null
+            Remove-Item -Path $cert.PSPath -Force -ErrorAction SilentlyContinue
+          }
+          if (-not (Test-Path -LiteralPath $pfxPath -PathType Leaf)) {
+            Write-Error "Temporary debug signing certificate could not be created at $pfxPath."
+            exit 1
+          }
+          Write-Host "Temporary debug signing certificate is ready."
+
+      - name: Build debug EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish src/App/App.csproj -c Debug -r win-x64 --self-contained false -o publish
+
+      - name: Sign debug EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) {
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $signtool -or -not (Test-Path -LiteralPath $signtool -PathType Leaf)) {
+            Write-Error "signtool.exe could not be found in the installed Windows SDK."
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath "publish/App.exe" -PathType Leaf)) {
+            Write-Error "Expected EXE publish/App.exe was not found for signing."
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath "./debug-signing.pfx" -PathType Leaf)) {
+            Write-Error "Temporary debug signing certificate ./debug-signing.pfx is missing."
+            exit 1
+          }
+          & $signtool sign /f "./debug-signing.pfx" /p "debug" /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 "publish/App.exe"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "signtool.exe failed while signing publish/App.exe (exit code $LASTEXITCODE)."
+            exit 1
+          }
+          Write-Host "Successfully signed publish/App.exe with SHA256 digest and timestamp."
+
+      - name: Verify debug EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedExe = "publish/App.exe"
+          if (-not (Test-Path -LiteralPath $expectedExe -PathType Leaf)) {
+            Write-Host "Expected debug EXE '$expectedExe' was not found."
+            if (Test-Path -LiteralPath "publish" -PathType Container) {
+              $discovered = Get-ChildItem -Path "publish" -Filter "*.exe" -Recurse -File -ErrorAction SilentlyContinue
+              if ($discovered) {
+                Write-Host "EXE paths discovered inside publish:"
+                $discovered | ForEach-Object { Write-Host " - $($_.FullName)" }
+              } else {
+                Write-Host "No .exe files discovered inside publish."
+              }
+            } else {
+              Write-Host "The publish directory does not exist."
+            }
+            Write-Error "Verification failed: '$expectedExe' does not exist."
+            exit 1
+          }
+          $exeItem = Get-Item -LiteralPath $expectedExe
+          if ($exeItem.PSIsContainer) {
+            Write-Error "Verification failed: '$expectedExe' is not a regular file."
+            exit 1
+          }
+          if ($exeItem.Length -le 0) {
+            Write-Error "Verification failed: '$expectedExe' is empty (0 bytes)."
+            exit 1
+          }
+          if ($exeItem.Extension -ine ".exe") {
+            Write-Error "Verification failed: '$expectedExe' does not have the .exe extension."
+            exit 1
+          }
+          Write-Host "Verified EXE '$expectedExe' ($($exeItem.Length) bytes)."
+
+      - name: Upload debug EXE artifact
+        id: upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-exe
+          path: publish/App.exe
+          if-no-files-found: error
+
+      - name: Prepare EXE release asset
+        id: prepare_asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceExe = "publish/App.exe"
+          if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+            Write-Error "Verified EXE '$sourceExe' is missing."
+            exit 1
+          }
+          $rawRepo = "${{ github.event.repository.name }}"
+          $sanitizedRepo = ($rawRepo -replace '[^A-Za-z0-9._-]', '-') -replace '-{2,}', '-'
+          $sanitizedRepo = $sanitizedRepo.Trim('-')
+          if ([string]::IsNullOrWhiteSpace($sanitizedRepo)) {
+            $sanitizedRepo = "app"
+          }
+          $runNumber = $env:GITHUB_RUN_NUMBER
+          $assetName = "$sanitizedRepo-debug-build-$runNumber.exe"
+          $runnerTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
+          $stagingDir = Join-Path $runnerTemp ("release-asset-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+          $assetPath = Join-Path $stagingDir $assetName
+          Copy-Item -LiteralPath $sourceExe -Destination $assetPath -Force
+          $copied = Get-Item -LiteralPath $assetPath
+          if (-not $copied -or $copied.PSIsContainer -or $copied.Length -le 0 -or $copied.Extension -ine ".exe") {
+            Write-Error "Prepared release asset validation failed for '$assetPath'."
+            exit 1
+          }
+          "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Prepared EXE release asset: $assetName"
+
+      - name: Publish EXE to GitHub Releases
+        id: publish_release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & gh --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::GitHub CLI (gh) is unavailable. Skipping release publishing."
+            exit 1
+          }
+          $assetPath = "${{ steps.prepare_asset.outputs.asset_path }}"
+          if ([string]::IsNullOrWhiteSpace($assetPath) -or -not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
+            Write-Host "::warning::Prepared release asset does not exist at '$assetPath'."
+            exit 1
+          }
+          $assetItem = Get-Item -LiteralPath $assetPath
+          if ($assetItem.PSIsContainer -or $assetItem.Length -le 0 -or $assetItem.Extension -ine ".exe") {
+            Write-Host "::warning::Prepared release asset '$assetPath' is not a valid non-empty .exe file."
+            exit 1
+          }
+          $runNumber = $env:GITHUB_RUN_NUMBER
+          $runAttempt = $env:GITHUB_RUN_ATTEMPT
+          $commitSha = $env:GITHUB_SHA
+          $tag = "debug-exe-build-$runNumber-$runAttempt"
+          $title = "Debug EXE Build #$runNumber"
+          $notesFile = Join-Path (Split-Path -Parent $assetPath) "release-notes.md"
+          @(
+            "This is an automatically generated debug EXE built by GitHub Actions."
+            ""
+            "- **GitHub Actions Run Number:** $runNumber"
+            "- **GitHub Actions Run Attempt:** $runAttempt"
+            "- **Source Commit SHA:** $commitSha"
+            "- **Purpose:** Intended for testing only; this is not a production store release."
+            "- **Signing:** Signed only with a temporary debug signing certificate."
+          ) | Set-Content -LiteralPath $notesFile -Encoding utf8
+          & gh release create "$tag" "$assetPath" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --title "$title" `
+            --target "$commitSha" `
+            --notes-file "$notesFile" `
+            --latest
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::GitHub Release creation failed for tag '$tag' (exit code $LASTEXITCODE). The app-debug-exe artifact remains available."
+            exit 1
+          }
+          Write-Host "Successfully published release '$tag'."
+
+      - name: Report EXE download result
+        if: always() && steps.upload_artifact.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runNumber = $env:GITHUB_RUN_NUMBER
+          $runAttempt = $env:GITHUB_RUN_ATTEMPT
+          $tag = "debug-exe-build-$runNumber-$runAttempt"
+          $title = "Debug EXE Build #$runNumber"
+          $assetName = "${{ steps.prepare_asset.outputs.asset_name }}"
+          if ("${{ steps.publish_release.outcome }}" -eq "success") {
+            $rawRelease = (& gh release view "$tag" --repo "$env:GITHUB_REPOSITORY" --json tagName,name,url,assets) | Out-String
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($rawRelease)) {
+              Write-Host "::warning::Release was created but could not be retrieved via gh release view."
+              exit 0
+            }
+            $releaseJson = $rawRelease | ConvertFrom-Json
+            $releaseUrl = $releaseJson.url
+            Write-Host "Release tag: $($releaseJson.tagName)"
+            Write-Host "Release title: $($releaseJson.name)"
+            Write-Host "Release URL: $releaseUrl"
+            Write-Host "EXE asset filename: $assetName"
+            @(
+              "### Debug EXE Release Published"
+              ""
+              "- **Release Tag:** $($releaseJson.tagName)"
+              "- **Release Title:** $($releaseJson.name)"
+              "- **Release Page URL:** $releaseUrl"
+              "- **EXE Asset Filename:** $assetName"
+              ""
+              "Download the EXE directly from the **Assets** section on the GitHub Release page above."
+              "The normal GitHub Actions artifact **app-debug-exe** is also available as a backup."
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          } else {
+            Write-Host "::warning::GitHub Release publishing failed for tag '$tag'. The debug EXE build succeeded and the Actions artifact 'app-debug-exe' remains available."
+            @(
+              "### Debug EXE Build Succeeded (Release Publishing Failed)"
+              ""
+              "> **Warning:** Publishing the GitHub Release failed, so no release URL was created."
+              ""
+              "- **EXE Build Status:** Succeeded"
+              "- **Backup Artifact:** Download **app-debug-exe** from the workflow run Artifacts section."
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
